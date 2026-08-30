@@ -4,8 +4,8 @@ import os
 import queue
 import threading
 
-from PIL import Image, ImageOps
-from PySide6.QtCore import QRect, QSize, Qt, QTimer, Signal
+from PIL import Image, ImageChops, ImageOps
+from PySide6.QtCore import QRect, QSettings, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QIcon, QKeySequence, QPainter, QPen, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -29,6 +29,8 @@ import theme
 STRIP_W = 96
 STRIP_H = 64
 STATUS_ROLE = Qt.ItemDataRole.UserRole + 1
+CLIP_THRESHOLD = 252
+_SETTINGS = QSettings("GalleryUploader", "GalleryUploader")
 
 
 def _fit_image(path, max_w, max_h):
@@ -36,6 +38,23 @@ def _fit_image(path, max_w, max_h):
     image = ImageOps.exif_transpose(image)
     image.thumbnail((max(120, max_w), max(120, max_h)), Image.Resampling.LANCZOS)
     return image.convert("RGB")
+
+
+def highlight_clip_pref():
+    return _SETTINGS.value("highlight_clip", False, type=bool)
+
+
+def set_highlight_clip_pref(on):
+    _SETTINGS.setValue("highlight_clip", bool(on))
+
+
+def apply_highlight_clip(image, threshold=CLIP_THRESHOLD):
+    rgb = image.convert("RGB")
+    red, green, blue = rgb.split()
+    hottest = ImageChops.lighter(ImageChops.lighter(red, green), blue)
+    mask = hottest.point(lambda value: 255 if value >= threshold else 0)
+    overlay = Image.new("RGB", rgb.size, (255, 48, 88))
+    return Image.composite(overlay, rgb, mask)
 
 
 def _placeholder_icon():
@@ -100,6 +119,7 @@ class LoupeView(QDialog):
         self.thumb_lookup = thumb_lookup
         self.tether_folder = tether_folder
         self.follow_latest = follow_latest
+        self.highlight_clip = highlight_clip_pref()
         self._fullscreen = False
         self._ready = queue.Queue()
         self._strip_ready = queue.Queue()
@@ -107,6 +127,7 @@ class LoupeView(QDialog):
         self._placeholder = _placeholder_icon()
         self._gen = 0
         self._current_qimage = None
+        self._clip_qimage = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -186,6 +207,16 @@ class LoupeView(QDialog):
         h.addWidget(self.follow_btn)
         self.follow_btn.style().unpolish(self.follow_btn)
         self.follow_btn.style().polish(self.follow_btn)
+        self.clip_btn = QToolButton()
+        self.clip_btn.setText("Highlights")
+        self.clip_btn.setCheckable(True)
+        self.clip_btn.setChecked(self.highlight_clip)
+        self.clip_btn.setProperty("chip", True)
+        self.clip_btn.setToolTip("Show blown highlights in red. Shortcut H.")
+        self.clip_btn.toggled.connect(self._on_clip_toggled)
+        h.addWidget(self.clip_btn)
+        self.clip_btn.style().unpolish(self.clip_btn)
+        self.clip_btn.style().polish(self.clip_btn)
         fs = QPushButton("Fullscreen  F")
         fs.clicked.connect(self.toggle_fullscreen)
         close_btn = QPushButton("Close  Esc")
@@ -216,7 +247,7 @@ class LoupeView(QDialog):
         footer.setFixedHeight(128)
         f = QVBoxLayout(footer)
         f.setContentsMargins(12, 6, 12, 8)
-        hint = QLabel("← → navigate     click a thumbnail     F fullscreen     Esc close")
+        hint = QLabel("← → navigate     click a thumbnail     H highlights     F fullscreen     Esc close")
         hint.setObjectName("dim")
         hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         f.addWidget(hint)
@@ -247,12 +278,21 @@ class LoupeView(QDialog):
         QShortcut(QKeySequence(Qt.Key.Key_Escape), self, self.close)
         QShortcut(QKeySequence(Qt.Key.Key_F), self, self.toggle_fullscreen)
         QShortcut(QKeySequence(Qt.Key.Key_F11), self, self.toggle_fullscreen)
+        QShortcut(QKeySequence(Qt.Key.Key_H), self, self._toggle_highlight_clip)
         QShortcut(QKeySequence(Qt.Key.Key_Home), self, lambda: self.goto(0))
         QShortcut(QKeySequence(Qt.Key.Key_End), self, lambda: self.goto(len(self.paths) - 1))
 
     def _on_follow_toggled(self, checked):
         self.follow_latest = checked
         self.follow_changed.emit(checked)
+
+    def _toggle_highlight_clip(self):
+        self.clip_btn.setChecked(not self.clip_btn.isChecked())
+
+    def _on_clip_toggled(self, checked):
+        self.highlight_clip = bool(checked)
+        set_highlight_clip_pref(self.highlight_clip)
+        self._apply_pixmap()
 
     def toggle_fullscreen(self):
         self._fullscreen = not self._fullscreen
@@ -309,15 +349,16 @@ class LoupeView(QDialog):
             image = _fit_image(path, max_w, max_h)
         except Exception:
             image = Image.new("RGB", (400, 280), (31, 35, 42))
-        self._ready.put((gen, pil_to_qimage(image)))
+        self._ready.put((gen, pil_to_qimage(image), pil_to_qimage(apply_highlight_clip(image))))
 
     def _pump(self):
         try:
             while True:
-                gen, qimage = self._ready.get_nowait()
+                gen, qimage, clip_qimage = self._ready.get_nowait()
                 if gen != self._gen:
                     continue
                 self._current_qimage = qimage
+                self._clip_qimage = clip_qimage
                 self.image_label.setText("")
                 self._apply_pixmap()
         except queue.Empty:
@@ -330,9 +371,10 @@ class LoupeView(QDialog):
             pass
 
     def _apply_pixmap(self):
-        if self._current_qimage is None or self.image_label.width() < 20:
+        source = self._clip_qimage if self.highlight_clip and self._clip_qimage is not None else self._current_qimage
+        if source is None or self.image_label.width() < 20:
             return
-        pix = QPixmap.fromImage(self._current_qimage)
+        pix = QPixmap.fromImage(source)
         scaled = pix.scaled(
             self.image_label.size(),
             Qt.AspectRatioMode.KeepAspectRatio,
