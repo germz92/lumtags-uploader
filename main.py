@@ -27,7 +27,7 @@ from PySide6.QtWidgets import (
 from db import get_client_logos, get_events
 from events_model import parse_events
 from logger import add_queue_handler, get_logger
-from platform_support import APP_NAME, APP_ID, app_icon_path
+from platform_support import APP_NAME, APP_ID, WINDOWS_APP_ID, app_icon_path
 from shooting_view import ShootingWorkspace
 from status_events import is_status_event
 from tether_intake import TetherIntake
@@ -276,10 +276,13 @@ def main():
     if sys.platform == "win32":
         import ctypes
 
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(WINDOWS_APP_ID)
 
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
+    app.setApplicationDisplayName(APP_NAME)
+    app.setOrganizationName("Lumetry")
+    app.setDesktopFileName(APP_ID)
     icon_path = app_icon_path()
     if icon_path:
         icon = QIcon(icon_path)
@@ -288,7 +291,7 @@ def main():
     app.setStyleSheet(theme.STYLESHEET)
     window = MainWindow()
     if icon_path:
-        window.setWindowIcon(QIcon(icon_path))
+        window.setWindowIcon(app.windowIcon())
     window.show()
     sys.exit(app.exec())
 

@@ -5,9 +5,11 @@ from dotenv import load_dotenv
 import atexit
 import threading
 from logger import get_logger
+from platform_support import executable_dir
 
 logger = get_logger("db")
 load_dotenv()
+load_dotenv(os.path.join(executable_dir(), ".env"))
 
 MONGO_URI = os.getenv("MONGO_URI")
 DATABASE_NAME = os.getenv("DATABASE_NAME", "test")

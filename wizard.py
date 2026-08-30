@@ -64,8 +64,8 @@ STEP_COPY = {
         "This is a local backup. The app also uploads each photo to the gallery.",
     ),
     "camera": (
-        "Plug in the camera so shots appear here",
-        "The app finds the Sony camera and connects on its own. Shoot JPEG or RAW+JPEG.",
+        "Connect the camera now",
+        "Wait until this screen to plug it in and turn it on. If it was already connected, unplug it, then plug it back in.",
     ),
 }
 
@@ -934,7 +934,7 @@ class SetupWizard(QWidget):
 
         btn_row = QHBoxLayout()
         self.scan_btn = QPushButton("Scan again")
-        self.scan_btn.clicked.connect(self._scan_cameras)
+        self.scan_btn.clicked.connect(self._rescan)
         btn_row.addWidget(self.scan_btn)
         btn_row.addStretch()
         self.content_layout.addLayout(btn_row)
@@ -958,7 +958,20 @@ class SetupWizard(QWidget):
             self.log_queue.put(f"Camera host started ({backend}).")
         return self.host
 
+    def _rescan(self):
+        if self.step_keys[self.step_index] != "camera":
+            return
+        self._camera_busy = False
+        if self.host:
+            try:
+                self.host.disconnect()
+            except Exception:
+                pass
+        self._scan_cameras()
+
     def _scan_cameras(self, gen=None):
+        if isinstance(gen, bool):
+            gen = None
         if gen is not None and gen != self._step_gen:
             return
         if self.step_keys[self.step_index] != "camera":

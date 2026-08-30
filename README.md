@@ -32,6 +32,8 @@ to walk the wizard and upload path on either OS.
 
 See [PACKAGING.md](PACKAGING.md) for the Mac `.app` / `.dmg` and Windows installer steps.
 
+The Windows installer is self-contained (Python, Qt, Sony host). The camera USB driver is a separate one-time Device Manager step — it cannot go in the per-user installer.
+
 Hand this to a Mac developer: [MAC_DMG.md](MAC_DMG.md).
 
 ```

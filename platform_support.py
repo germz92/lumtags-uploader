@@ -9,6 +9,7 @@ IS_WINDOWS = sys.platform == "win32"
 IS_FROZEN = getattr(sys, "frozen", False)
 APP_NAME = "LumTags Uploader"
 APP_ID = "com.lumtags.uploader"
+WINDOWS_APP_ID = "Lumetry.LumTagsUploader"
 
 
 def ui_font_family():
@@ -40,14 +41,15 @@ def app_support_dir():
 
 
 def app_icon_path():
-    root = resource_root()
-    for name in ("app_icon.ico", "app_icon.png"):
-        path = os.path.join(root, "assets", name)
-        if os.path.isfile(path):
-            return path
-        bundled = os.path.join(root, name)
-        if os.path.isfile(bundled):
-            return bundled
+    roots = [resource_root(), executable_dir(), os.path.dirname(os.path.abspath(__file__))]
+    for root in roots:
+        for name in ("app_icon.ico", "app_icon.png"):
+            for path in (
+                os.path.join(root, "assets", name),
+                os.path.join(root, name),
+            ):
+                if os.path.isfile(path):
+                    return path
     return ""
 
 
@@ -115,12 +117,14 @@ def default_parent_path():
 def camera_setup_steps():
     if IS_MAC:
         return (
+            "Do not plug in the camera until this step. If it is already connected, unplug it first.",
             "Set USB mode to Remote Shoot (PC Remote).",
-            "Plug in a data USB-C cable.",
+            "Plug in a data USB-C cable and turn the camera on.",
         )
     return (
+        "Do not plug in the camera until this step. If it is already connected, unplug it first.",
         "Set USB mode to Remote Shoot (PC Remote).",
-        "Plug in a USB data cable (not a charge-only cable).",
+        "Plug in a USB data cable (not charge-only) and turn the camera on.",
     )
 
 

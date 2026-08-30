@@ -16,19 +16,27 @@ host_candidates = [
     os.path.join(root, "dist", host_name),
 ]
 binaries = []
+datas = [
+    (os.path.join(root, "assets", "app_icon.ico"), "assets"),
+    (os.path.join(root, "assets", "app_icon.png"), "assets"),
+]
 for path in host_candidates:
     if os.path.isfile(path):
+        host_dir = os.path.dirname(path)
         binaries.append((path, "."))
+        for name in os.listdir(host_dir):
+            full = os.path.join(host_dir, name)
+            if name.lower().endswith(".dll"):
+                binaries.append((full, "."))
+            elif name == "CrAdapter" and os.path.isdir(full):
+                datas.append((full, "CrAdapter"))
         break
 
 a = Analysis(
     ["main.py"],
     pathex=[root],
     binaries=binaries,
-    datas=[
-        (os.path.join(root, "assets", "app_icon.ico"), "assets"),
-        (os.path.join(root, "assets", "app_icon.png"), "assets"),
-    ],
+    datas=datas,
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

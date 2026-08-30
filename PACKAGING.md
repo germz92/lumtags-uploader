@@ -95,24 +95,28 @@ Do this only on Windows, after `python main.py` talks to the camera.
 
 Quit the running app first so `crsdk_host.exe` is not locked.
 
-### 1. PyInstaller folder
+### 1. PyInstaller folder + Inno Setup
+
+Install [Inno Setup 6](https://jrsoftware.org/isinfo.php) once. Then:
 
 ```
 powershell -File scripts/build_windows.ps1
 ```
 
-Output: `dist\LumTags Uploader\LumTags Uploader.exe`.
+Output:
 
-Copy `Cr_Core.dll`, `monitor_protocol*.dll`, and the `CrAdapter\` folder next to `crsdk_host.exe` if they are not already there. Those come from the Windows SDK, not from git.
+- `dist\LumTags Uploader\LumTags Uploader.exe` (onedir payload)
+- `dist\LumTags-Uploader-Setup.exe` (per-user installer, same pattern as Catalog Builder)
 
-### 2. Inno Setup installer
+The installer ships Python, Qt, the Sony camera host, `Cr_Core.dll` / `monitor_protocol*.dll`, and `CrAdapter\`. Photographers do not install Python.
 
-1. Install [Inno Setup 6](https://jrsoftware.org/isinfo.php).
-2. Compile `installer/windows.iss` (or run `ISCC installer\windows.iss`).
+**USB driver is not in the installer.** Sony’s libusbK package needs Administrator rights and is not redistributable here. After install, if Device Manager does not show **Sony Remote Control Camera** under **libusbK USB Devices**, install it once with Have Disk on `srcameradriver.inf` from the Camera Remote SDK `Driver.zip`.
 
-Output: `dist\LumTags-Uploader-Setup.exe`.
+Copy `.env` into the install folder (next to `LumTags Uploader.exe`). The installer never bundles secrets.
 
-### 3. Optional code signing
+Copy `Cr_Core.dll`, `monitor_protocol*.dll`, and the `CrAdapter\` folder next to `crsdk_host.exe` in `crsdk_host\build\Release` before you package if they are not already there. Those come from the Windows SDK, not from git.
+
+### 2. Optional code signing
 
 ```
 signtool sign /tr http://timestamp.digicert.com /td sha256 /fd sha256 /n "Your Cert" ^
@@ -146,7 +150,8 @@ Do not copy:
 
 - [ ] Camera connects on that OS from source
 - [ ] Packaged app finds `crsdk_host` and the Sony adapters
-- [ ] `.env` is present next to the installed app, or the installer copies it
+- [ ] `.env` is copied next to the installed `LumTags Uploader.exe` (never committed or attached to a GitHub release)
 - [ ] One live JPEG uploads to the gallery
 - [ ] Mac: notarized DMG opens on a second Mac
-- [ ] Windows: installer runs on a clean PC and the Start Menu shortcut works
+- [ ] Windows: installer runs on a clean PC and the Start Menu / taskbar icon is the LT mark
+- [ ] Windows: camera appears under libusbK after the one-time driver step if needed

@@ -1,0 +1,10 @@
+LumTags Uploader is installed.
+
+The app itself is self-contained (Python, Qt, and the Sony camera host). You do not need to install Python.
+
+Camera USB driver (one-time, not part of this installer):
+1. Plug the camera in after the app is open, USB mode Remote Shoot (PC Remote).
+2. If Windows does not show it as Sony Remote Control Camera under libusbK USB Devices, install Sony's libusbK driver (Have Disk on srcameradriver.inf from the Camera Remote SDK Driver.zip).
+3. That step needs Administrator rights. This installer stays per-user so it does not try to install drivers.
+
+Put your .env file in the same folder as LumTags Uploader.exe (the install folder) so events and S3 uploads work.
