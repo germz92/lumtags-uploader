@@ -41,6 +41,8 @@ If `crsdk_host` is missing, the app falls back to the JPEG simulator. That is fi
 
 ---
 
+A copy-paste brief for a Mac developer is in [MAC_DMG.md](MAC_DMG.md).
+
 ## Mac: `.app` then `.dmg`
 
 Do this only on a Mac, after `python3 main.py` talks to the camera.

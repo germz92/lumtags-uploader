@@ -32,6 +32,8 @@ to walk the wizard and upload path on either OS.
 
 See [PACKAGING.md](PACKAGING.md) for the Mac `.app` / `.dmg` and Windows installer steps.
 
+Hand this to a Mac developer: [MAC_DMG.md](MAC_DMG.md).
+
 ```
 # macOS
 ./scripts/build_macos.sh
