@@ -1,0 +1,6 @@
+boto3
+pymongo
+python-dotenv
+watchdog
+PySide6
+Pillow
