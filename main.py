@@ -6,11 +6,13 @@ if "--host-simulator" in sys.argv:
     simulator_main()
     raise SystemExit(0)
 
+import atexit
 import queue
+import threading
 import time
 
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QIcon, QPixmap, QTextCursor
+from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtGui import QIcon, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
     QHBoxLayout,
@@ -24,21 +26,26 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from db import get_client_logos, get_events
-from events_model import parse_events
+from busy import BusyOverlay, LaunchSplash
 from logger import add_queue_handler, get_logger
-from platform_support import APP_NAME, APP_ID, WINDOWS_APP_ID, app_icon_path
-from shooting_view import ShootingWorkspace
+from platform_support import (
+    APP_NAME,
+    APP_ID,
+    WINDOWS_APP_ID,
+    app_icon_path,
+    app_icon_pixmap,
+    kill_stale_camera_hosts,
+)
 from status_events import is_status_event
-from tether_intake import TetherIntake
-from tether_session import write_session
 import theme
-from wizard import SetupWizard
 
 logger = get_logger("main")
 
 
 class MainWindow(QMainWindow):
+    ready = Signal()
+    _events_ready = Signal(object, object)
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_NAME)
@@ -49,6 +56,9 @@ class MainWindow(QMainWindow):
         self.log_batch = []
         self.last_log_update = 0
         self._log_expanded = False
+        self._booted = False
+        self._ending = False
+        self._quit_done = False
 
         self.wizard = None
         self.workspace = None
@@ -66,20 +76,50 @@ class MainWindow(QMainWindow):
         self.stack = QStackedWidget()
         root.addWidget(self.stack, 1)
         self._build_log(root)
-        self._show_wizard()
+        self._overlay = BusyOverlay(central)
 
         add_queue_handler(logger, self.log_queue)
+        self._events_ready.connect(self._on_events_ready)
         self._log_timer = QTimer(self)
         self._log_timer.timeout.connect(self.poll_log_queue)
         self._log_timer.start(200)
 
+    def begin_boot(self):
+        threading.Thread(target=self._boot_worker, daemon=True).start()
+
     def closeEvent(self, event):
-        if self.workspace:
-            self.workspace.shutdown()
-        self._teardown_session(wait_uploads=False)
-        if self.wizard:
-            self.wizard.destroy_host()
+        self._quit_clean()
         event.accept()
+
+    def _quit_clean(self):
+        """Kill the camera host immediately so a leftover PTP session cannot linger."""
+        if self._quit_done:
+            return
+        self._quit_done = True
+        if self.workspace:
+            try:
+                self.workspace.shutdown()
+            except Exception:
+                pass
+        if self.intake:
+            try:
+                self.intake.shutdown(wait=False)
+            except Exception:
+                pass
+            self.intake = None
+        if self.host:
+            try:
+                self.host.close(force=True)
+            except Exception:
+                pass
+            self.host = None
+        if self.wizard:
+            try:
+                self.wizard.destroy_host()
+            except Exception:
+                pass
+            self.wizard.host = None
+        kill_stale_camera_hosts()
 
     def _build_header(self, root):
         header = QWidget()
@@ -88,17 +128,11 @@ class MainWindow(QMainWindow):
         self.app_header = header
         layout = QHBoxLayout(header)
         layout.setContentsMargins(16, 0, 16, 0)
-        icon_path = app_icon_path()
-        if icon_path:
+        pixmap = app_icon_pixmap(28)
+        if not pixmap.isNull():
             mark = QLabel()
-            mark.setPixmap(
-                QPixmap(icon_path).scaled(
-                    28,
-                    28,
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation,
-                )
-            )
+            mark.setFixedSize(28, 28)
+            mark.setPixmap(pixmap)
             layout.addWidget(mark)
         title = QLabel(APP_NAME)
         title.setObjectName("pageTitle")
@@ -135,6 +169,7 @@ class MainWindow(QMainWindow):
 
     def _clear_stage(self):
         if self.wizard:
+            self.wizard.shutdown()
             self.stack.removeWidget(self.wizard)
             self.wizard.deleteLater()
             self.wizard = None
@@ -144,29 +179,60 @@ class MainWindow(QMainWindow):
             self.workspace.deleteLater()
             self.workspace = None
 
-    def _load_events(self):
-        self.events = parse_events(get_events(), get_client_logos())
-        self.log_queue.put(f"Loaded {sum(len(e.collections) for e in self.events)} collections.")
+    def _fetch_events(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from db import get_client_logos, get_events
+        from events_model import parse_events
 
-    def _show_wizard(self):
-        self._clear_stage()
-        self.app_header.show()
-        self._load_events()
-        self.wizard = SetupWizard(events=self.events, log_queue=self.log_queue)
-        self.wizard.finished.connect(self._start_session)
-        self.stack.addWidget(self.wizard)
-        self.stack.setCurrentWidget(self.wizard)
-        if not self.events:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            events_future = pool.submit(get_events)
+            logos_future = pool.submit(get_client_logos)
+            events = parse_events(events_future.result(), logos_future.result())
+        self.log_queue.put(f"Loaded {sum(len(e.collections) for e in events)} collections.")
+        return events
+
+    def _boot_worker(self):
+        try:
+            self._events_ready.emit(self._fetch_events(), None)
+        except Exception as exc:
+            self._events_ready.emit([], exc)
+
+    def _on_events_ready(self, events, error):
+        try:
+            self._present_wizard(events)
+        except Exception:
+            logger.exception("Failed to open setup")
+        self._overlay.hide_busy()
+        self._ending = False
+        if not self._booted:
+            self._booted = True
+            self.ready.emit()
+        if error or not events:
             QMessageBox.warning(
                 self,
                 "No events",
                 "Could not load events from the database. Check MongoDB and refresh by restarting setup.",
             )
 
+    def _present_wizard(self, events):
+        from wizard import SetupWizard
+
+        self._clear_stage()
+        self.app_header.show()
+        self.events = events or []
+        self.wizard = SetupWizard(events=self.events, log_queue=self.log_queue)
+        self.wizard.finished.connect(self._start_session)
+        self.stack.addWidget(self.wizard)
+        self.stack.setCurrentWidget(self.wizard)
+
     def _start_session(self, result):
         QTimer.singleShot(10, lambda r=result: self._enter_session(r))
 
     def _enter_session(self, result):
+        from shooting_view import ShootingWorkspace
+        from tether_intake import TetherIntake
+        from tether_session import write_session
+
         collection = result["collection"]
         tether_folder = result["tether_folder"]
         host = result["host"]
@@ -218,8 +284,40 @@ class MainWindow(QMainWindow):
         self.log_queue.put(f"Session started: {collection.full_label} → {tether_folder}")
 
     def _end_session(self):
-        self._teardown_session(wait_uploads=False)
-        self._show_wizard()
+        if self._ending:
+            return
+        self._ending = True
+        self._overlay.show_busy(
+            "Ending session…",
+            "Disconnecting the camera and returning to setup. This will take a few seconds.",
+        )
+        if self.workspace:
+            self.workspace.shutdown()
+            self.workspace.setEnabled(False)
+        host = self.host
+        intake = self.intake
+        self.host = None
+        self.intake = None
+        if self.wizard:
+            self.wizard.host = None
+        threading.Thread(target=self._end_session_worker, args=(host, intake), daemon=True).start()
+
+    def _end_session_worker(self, host, intake):
+        if intake:
+            try:
+                intake.shutdown(wait=False)
+            except Exception:
+                pass
+        if host:
+            try:
+                host.disconnect()
+                host.close()
+            except Exception:
+                pass
+        try:
+            self._events_ready.emit(self._fetch_events(), None)
+        except Exception as exc:
+            self._events_ready.emit([], exc)
 
     def _teardown_session(self, wait_uploads=False):
         if self.intake:
@@ -227,13 +325,14 @@ class MainWindow(QMainWindow):
             self.intake = None
         if self.host:
             try:
-                self.host.disconnect()
-                self.host.close()
+                self.host.close(force=not wait_uploads)
             except Exception:
                 pass
             self.host = None
         if self.wizard:
             self.wizard.host = None
+        if not wait_uploads:
+            kill_stale_camera_hosts()
 
     def poll_log_queue(self):
         current_time = time.time()
@@ -289,11 +388,28 @@ def main():
         app.setWindowIcon(icon)
     app.setStyle("Fusion")
     app.setStyleSheet(theme.STYLESHEET)
+
+    splash = LaunchSplash()
+    if icon_path:
+        splash.setWindowIcon(app.windowIcon())
+    splash.show()
+    app.processEvents()
+
     window = MainWindow()
     if icon_path:
         window.setWindowIcon(app.windowIcon())
-    window.show()
+    window.ready.connect(lambda: _reveal_window(window, splash))
+    app.aboutToQuit.connect(window._quit_clean)
+    atexit.register(kill_stale_camera_hosts)
+    window.begin_boot()
     sys.exit(app.exec())
+
+
+def _reveal_window(window, splash):
+    window.show()
+    window.raise_()
+    window.activateWindow()
+    splash.close()
 
 
 if __name__ == "__main__":

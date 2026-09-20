@@ -79,13 +79,16 @@ Without this, Gatekeeper blocks the app.
 APP="dist/LumTags Uploader.app"
 IDENTITY="Developer ID Application: Your Name (TEAMID)"
 
-codesign --deep --force --options runtime --sign "$IDENTITY" "$APP"
+CODESIGN_IDENTITY="$IDENTITY" ./scripts/build_macos.sh
+./scripts/build_dmg.sh
 xcrun notarytool submit "dist/LumTags Uploader.dmg" \
   --apple-id "you@example.com" --team-id TEAMID --password "@keychain:AC_PASSWORD" --wait
 xcrun stapler staple "dist/LumTags Uploader.dmg"
 ```
 
-Hardened runtime may need extra entitlements later (USB / camera). If notarization fails, read the log from `notarytool log`.
+Sign through `build_macos.sh`: under hardened runtime the `crsdk_host` helper needs
+`packaging/macos.entitlements` to load Sony's dylibs, and signing only the bundle drops
+them. If notarization fails, read the log from `notarytool log`.
 
 ---
 

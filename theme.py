@@ -57,9 +57,19 @@ def draw_upload_check(painter, image_rect, size=22):
 
 def chip_style(fg, bg) -> str:
     return (
-        f"color: {fg}; background-color: {bg}; border-radius: 10px; "
-        f"padding: 4px 10px; font-weight: 600; font-size: 11px;"
+        f"color: {fg}; background-color: {bg}; border: none; border-radius: 8px; "
+        f"padding: 2px 8px; font-weight: 600; font-size: 11px;"
     )
+
+
+def style_status_chip(label, fg, bg):
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QSizePolicy
+
+    label.setStyleSheet(chip_style(fg, bg))
+    label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    label.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
+    label.setFixedHeight(26)
 
 
 STYLESHEET = f"""
@@ -122,6 +132,13 @@ QLabel#lostBanner {{
     padding: 8px 16px;
     border-radius: 8px;
 }}
+QLabel#importantCallout {{
+    background-color: {WARN_BG};
+    color: {WARN};
+    padding: 10px 14px;
+    border-radius: 8px;
+    font-weight: 700;
+}}
 QWidget#cameraCard {{
     background-color: {BG_RAISED};
     border: 1px solid {BORDER};
@@ -140,6 +157,19 @@ QProgressBar#cameraBusy {{
     min-height: 4px;
     background-color: {BG_INPUT};
 }}
+QWidget#busySplash {{
+    background-color: {BG_PANEL};
+    border: 1px solid {BORDER};
+    border-radius: 16px;
+}}
+QWidget#busyOverlay {{
+    background-color: rgba(18, 20, 23, 214);
+}}
+QWidget#busyCard {{
+    background-color: {BG_PANEL};
+    border: 1px solid {BORDER};
+    border-radius: 16px;
+}}
 
 QWidget#headerBar {{
     background-color: {BG_PANEL};
@@ -152,6 +182,20 @@ QWidget#sidebar {{
 QWidget#uploadRail {{
     background-color: {BG_PANEL};
     border-left: 1px solid {BORDER};
+}}
+QWidget#photoInfo {{
+    background-color: {BG_RAISED};
+    border: 1px solid {BORDER};
+    border-radius: 8px;
+}}
+QLabel#photoInfoName {{
+    font-size: 12px;
+    font-weight: 600;
+    color: {TEXT};
+}}
+QLabel#photoInfoMeta, QLabel#photoInfoSettings {{
+    font-size: 11px;
+    color: {TEXT_DIM};
 }}
 QWidget#statusBar {{
     background-color: {BG_PANEL};

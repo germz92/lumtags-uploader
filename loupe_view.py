@@ -5,30 +5,27 @@ import queue
 import threading
 
 from PIL import Image, ImageChops, ImageOps
-from PySide6.QtCore import QRect, QSettings, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QIcon, QKeySequence, QPainter, QPen, QPixmap, QShortcut
+from PySide6.QtCore import QRect, QRectF, QSettings, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QKeySequence, QPainter, QPainterPath, QPen, QPixmap, QShortcut
 from PySide6.QtWidgets import (
-    QAbstractItemView,
     QDialog,
     QHBoxLayout,
     QLabel,
-    QListWidget,
-    QListWidgetItem,
+    QProgressBar,
     QPushButton,
-    QStyle,
-    QStyledItemDelegate,
+    QScrollArea,
+    QSizePolicy,
     QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
-from image_util import make_thumbnail, pil_to_qimage
+from image_util import make_thumbnail, pixmap_is_placeholder, pil_to_qimage
 from status_events import STATUS_FAILED, STATUS_UPLOADED
 import theme
 
 STRIP_W = 96
-STRIP_H = 64
-STATUS_ROLE = Qt.ItemDataRole.UserRole + 1
+STRIP_H = 72
 CLIP_THRESHOLD = 252
 _SETTINGS = QSettings("GalleryUploader", "GalleryUploader")
 
@@ -57,40 +54,137 @@ def apply_highlight_clip(image, threshold=CLIP_THRESHOLD):
     return Image.composite(overlay, rgb, mask)
 
 
-def _placeholder_icon():
-    pix = QPixmap(STRIP_W, STRIP_H)
-    pix.fill(QColor(theme.BG_INPUT))
-    return QIcon(pix)
+def _draw_fitted_pixmap(painter, box, pixmap):
+    device = painter.device()
+    dpr = device.devicePixelRatioF() if device is not None else 1.0
+    scaled = pixmap.scaled(
+        max(1, int(box.width() * dpr)),
+        max(1, int(box.height() * dpr)),
+        Qt.AspectRatioMode.KeepAspectRatio,
+        Qt.TransformationMode.SmoothTransformation,
+    )
+    scaled.setDevicePixelRatio(dpr)
+    width = max(1, int(scaled.width() / dpr))
+    height = max(1, int(scaled.height() / dpr))
+    dest = QRect(
+        box.x() + (box.width() - width) // 2,
+        box.y() + (box.height() - height) // 2,
+        width,
+        height,
+    )
+    painter.drawPixmap(dest, scaled)
+    return dest
 
 
-class StripDelegate(QStyledItemDelegate):
-    def paint(self, painter, option, index):
-        painter.save()
+class _StripCell(QWidget):
+    clicked = Signal()
+
+    def __init__(self, path, parent=None):
+        super().__init__(parent)
+        self.path = path
+        self.pixmap = QPixmap()
+        self.status = None
+        self.selected = False
+        self.setFixedSize(STRIP_W + 10, STRIP_H + 10)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def set_pixmap(self, pixmap):
+        self.pixmap = pixmap if isinstance(pixmap, QPixmap) else QPixmap()
+        self.update()
+
+    def set_status(self, status):
+        self.status = status
+        self.update()
+
+    def set_selected(self, on):
+        self.selected = bool(on)
+        self.update()
+
+    def mousePressEvent(self, event):
+        self.clicked.emit()
+        super().mousePressEvent(event)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        rect = option.rect.adjusted(2, 2, -2, -2)
-        selected = bool(option.state & QStyle.StateFlag.State_Selected)
+        rect = self.rect().adjusted(2, 2, -2, -2)
+        image_rect = rect.adjusted(5, 5, -5, -5)
 
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QColor(theme.BG_INPUT))
         painter.drawRoundedRect(rect, 6, 6)
-        if selected:
+
+        check_rect = image_rect
+        if not self.pixmap.isNull():
+            clip = QPainterPath()
+            clip.addRoundedRect(QRectF(image_rect), 4, 4)
+            painter.setClipPath(clip)
+            check_rect = _draw_fitted_pixmap(painter, image_rect, self.pixmap)
+            painter.setClipping(False)
+
+        if self.selected:
             painter.setPen(QPen(QColor(theme.ACCENT), 2))
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawRoundedRect(rect.adjusted(1, 1, -1, -1), 6, 6)
 
-        image_rect = rect.adjusted(4, 4, -4, -4)
-        icon = index.data(Qt.ItemDataRole.DecorationRole)
-        if isinstance(icon, QIcon) and not icon.isNull():
-            pixmap = icon.pixmap(image_rect.size())
-            if not pixmap.isNull():
-                x = image_rect.x() + (image_rect.width() - pixmap.width()) // 2
-                y = image_rect.y() + (image_rect.height() - pixmap.height()) // 2
-                painter.drawPixmap(x, y, pixmap)
-                image_rect = QRect(x, y, pixmap.width(), pixmap.height())
+        if self.status == STATUS_UPLOADED:
+            theme.draw_upload_check(painter, check_rect, size=10)
+        painter.end()
 
-        if index.data(STATUS_ROLE) == STATUS_UPLOADED:
-            theme.draw_upload_check(painter, image_rect, size=14)
-        painter.restore()
+
+class _FilmStrip(QScrollArea):
+    item_clicked = Signal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("filmStrip")
+        self.setWidgetResizable(False)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setMaximumHeight(96)
+        self.setFrameShape(QScrollArea.Shape.NoFrame)
+        self._row = QWidget()
+        self._layout = QHBoxLayout(self._row)
+        self._layout.setContentsMargins(0, 2, 0, 2)
+        self._layout.setSpacing(6)
+        self._layout.addStretch()
+        self.setWidget(self._row)
+        self.cells = []
+
+    def clear(self):
+        for cell in self.cells:
+            self._layout.removeWidget(cell)
+            cell.deleteLater()
+        self.cells.clear()
+        self._relayout()
+
+    def add_cell(self, path, at_front=False):
+        cell = _StripCell(path, self._row)
+        cell.clicked.connect(lambda: self.item_clicked.emit(self.cells.index(cell)))
+        if at_front:
+            self._layout.insertWidget(0, cell)
+            self.cells.insert(0, cell)
+        else:
+            self._layout.insertWidget(self._layout.count() - 1, cell)
+            self.cells.append(cell)
+        self._relayout()
+        return cell
+
+    def cell_for_path(self, path):
+        for cell in self.cells:
+            if cell.path == path:
+                return cell
+        return None
+
+    def set_selected_index(self, index):
+        for i, cell in enumerate(self.cells):
+            cell.set_selected(i == index)
+        if 0 <= index < len(self.cells):
+            self.ensureWidgetVisible(self.cells[index])
+
+    def _relayout(self):
+        self._row.adjustSize()
+        self._row.resize(self._row.sizeHint())
 
 
 class LoupeView(QDialog):
@@ -124,7 +218,7 @@ class LoupeView(QDialog):
         self._ready = queue.Queue()
         self._strip_ready = queue.Queue()
         self._pending_thumbs = set()
-        self._placeholder = _placeholder_icon()
+        self._strip_retries = {}
         self._gen = 0
         self._current_qimage = None
         self._clip_qimage = None
@@ -166,12 +260,18 @@ class LoupeView(QDialog):
         self.meta_label.setText(f"{self.index + 1}  /  {len(self.paths)}" if self.paths else "")
 
     def set_strip_thumb(self, path, pixmap):
-        if path not in self.paths or pixmap is None or pixmap.isNull():
+        if path not in self.paths:
             return
-        item = self.strip.item(self.paths.index(path))
-        if item:
-            item.setIcon(QIcon(pixmap))
+        cell = self.strip.cell_for_path(path)
+        if cell is None:
+            return
+        if pixmap is None or pixmap_is_placeholder(pixmap):
             self._pending_thumbs.discard(path)
+            self._schedule_strip_retry(path)
+            return
+        cell.set_pixmap(pixmap)
+        self._pending_thumbs.discard(path)
+        self._strip_retries.pop(path, None)
 
     def set_follow_latest(self, on):
         self.follow_latest = bool(on)
@@ -194,9 +294,25 @@ class LoupeView(QDialog):
         self.meta_label = QLabel()
         self.meta_label.setObjectName("dim")
         self.status_chip = QLabel()
+        theme.style_status_chip(self.status_chip, theme.TEXT_DIM, theme.BG_INPUT)
         h.addWidget(self.title_label)
         h.addWidget(self.meta_label)
         h.addStretch()
+        progress = QWidget()
+        progress.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        progress_layout = QVBoxLayout(progress)
+        progress_layout.setContentsMargins(0, 10, 8, 10)
+        progress_layout.setSpacing(3)
+        self.upload_label = QLabel("0 / 0 uploaded")
+        self.upload_label.setObjectName("dim")
+        self.upload_bar = QProgressBar()
+        self.upload_bar.setRange(0, 1000)
+        self.upload_bar.setValue(0)
+        self.upload_bar.setTextVisible(False)
+        self.upload_bar.setFixedSize(160, 5)
+        progress_layout.addWidget(self.upload_label)
+        progress_layout.addWidget(self.upload_bar)
+        h.addWidget(progress)
         h.addWidget(self.status_chip)
         self.follow_btn = QToolButton()
         self.follow_btn.setText("Follow latest")
@@ -244,30 +360,15 @@ class LoupeView(QDialog):
 
         footer = QWidget()
         footer.setObjectName("statusBar")
-        footer.setFixedHeight(128)
+        footer.setFixedHeight(136)
         f = QVBoxLayout(footer)
         f.setContentsMargins(12, 6, 12, 8)
         hint = QLabel("← → navigate     click a thumbnail     H highlights     F fullscreen     Esc close")
         hint.setObjectName("dim")
         hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         f.addWidget(hint)
-        self.strip = QListWidget()
-        self.strip.setObjectName("filmStrip")
-        self.strip.setViewMode(QListWidget.ViewMode.IconMode)
-        self.strip.setFlow(QListWidget.Flow.LeftToRight)
-        self.strip.setWrapping(False)
-        self.strip.setMovement(QListWidget.Movement.Static)
-        self.strip.setResizeMode(QListWidget.ResizeMode.Adjust)
-        self.strip.setIconSize(QSize(STRIP_W, STRIP_H))
-        self.strip.setGridSize(QSize(STRIP_W + 12, STRIP_H + 12))
-        self.strip.setUniformItemSizes(True)
-        self.strip.setSpacing(4)
-        self.strip.setMaximumHeight(88)
-        self.strip.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self.strip.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.strip.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.strip.setItemDelegate(StripDelegate(self.strip))
-        self.strip.itemClicked.connect(self._strip_clicked)
+        self.strip = _FilmStrip()
+        self.strip.item_clicked.connect(self.goto)
         f.addWidget(self.strip)
         root.addWidget(footer)
         self._rebuild_strip()
@@ -361,12 +462,13 @@ class LoupeView(QDialog):
                 self._clip_qimage = clip_qimage
                 self.image_label.setText("")
                 self._apply_pixmap()
+                self._fill_strip_from_preview()
         except queue.Empty:
             pass
         try:
             while True:
                 path, qimage = self._strip_ready.get_nowait()
-                self.set_strip_thumb(path, QPixmap.fromImage(qimage))
+                self.set_strip_thumb(path, QPixmap.fromImage(qimage) if qimage is not None else None)
         except queue.Empty:
             pass
 
@@ -385,66 +487,87 @@ class LoupeView(QDialog):
     def _paint_status(self, status, reason):
         if status == STATUS_UPLOADED:
             self.status_chip.setText("Uploaded")
-            self.status_chip.setStyleSheet(theme.chip_style(theme.GOOD, theme.GOOD_BG))
+            theme.style_status_chip(self.status_chip, theme.GOOD, theme.GOOD_BG)
         elif status == STATUS_FAILED:
             self.status_chip.setText(reason or "Failed")
-            self.status_chip.setStyleSheet(theme.chip_style(theme.BAD, theme.BAD_BG))
+            theme.style_status_chip(self.status_chip, theme.BAD, theme.BAD_BG)
         else:
             self.status_chip.setText("Uploading")
-            self.status_chip.setStyleSheet(theme.chip_style(theme.WARN, theme.WARN_BG))
+            theme.style_status_chip(self.status_chip, theme.WARN, theme.WARN_BG)
+
+    def set_upload_progress(self, uploaded, total, pending=0, failed=0):
+        total = max(int(total or 0), 0)
+        uploaded = max(int(uploaded or 0), 0)
+        self.upload_bar.setValue(int((uploaded / total) * 1000) if total else 0)
+        extra = []
+        if pending:
+            extra.append(f"{pending} pending")
+        if failed:
+            extra.append(f"{failed} failed")
+        suffix = f"  ·  {', '.join(extra)}" if extra else ""
+        self.upload_label.setText(f"{uploaded} / {total} uploaded{suffix}")
 
     def _rebuild_strip(self):
         self.strip.clear()
         self._pending_thumbs.clear()
+        self._strip_retries.clear()
         for path in self.paths:
             self._add_strip_item(path)
         self._highlight_strip()
 
     def _sync_strip_status(self):
-        for index, path in enumerate(self.paths):
-            item = self.strip.item(index)
-            if item is None:
-                continue
+        for path, cell in zip(self.paths, self.strip.cells):
             status, _reason = self.status_lookup(path)
-            item.setData(STATUS_ROLE, status)
-        self.strip.viewport().update()
+            cell.set_status(status)
 
     def _add_strip_item(self, path, at_front=False):
-        item = QListWidgetItem()
-        item.setToolTip(os.path.basename(path))
-        item.setSizeHint(QSize(STRIP_W + 12, STRIP_H + 12))
+        cell = self.strip.add_cell(path, at_front=at_front)
+        cell.setToolTip(os.path.basename(path))
         status, _reason = self.status_lookup(path)
-        item.setData(STATUS_ROLE, status)
+        cell.set_status(status)
         pixmap = self.thumb_lookup(path) if self.thumb_lookup else None
-        if pixmap is not None and not pixmap.isNull():
-            item.setIcon(QIcon(pixmap))
+        if pixmap is not None and not pixmap_is_placeholder(pixmap):
+            cell.set_pixmap(pixmap)
         else:
-            item.setIcon(self._placeholder)
             self._request_strip_thumb(path)
-        if at_front:
-            self.strip.insertItem(0, item)
-        else:
-            self.strip.addItem(item)
+
+    def _thumb_folder(self):
+        if self.tether_folder:
+            return self.tether_folder
+        if self.paths:
+            return os.path.dirname(self.paths[0])
+        return ""
 
     def _request_strip_thumb(self, path):
-        if not self.tether_folder or path in self._pending_thumbs:
+        if path in self._pending_thumbs or not self._thumb_folder():
             return
         self._pending_thumbs.add(path)
         threading.Thread(target=self._load_strip_thumb, args=(path,), daemon=True).start()
 
+    def _schedule_strip_retry(self, path):
+        attempt = self._strip_retries.get(path, 0)
+        if attempt >= 12:
+            return
+        self._strip_retries[path] = attempt + 1
+        QTimer.singleShot(400 * (attempt + 1), lambda p=path: self._request_strip_thumb(p))
+
     def _load_strip_thumb(self, path):
         try:
-            image = make_thumbnail(path, self.tether_folder)
-            self._strip_ready.put((path, pil_to_qimage(image)))
+            image = make_thumbnail(path, self._thumb_folder())
+            self._strip_ready.put((path, pil_to_qimage(image) if image is not None else None))
         except Exception:
-            self._pending_thumbs.discard(path)
+            self._strip_ready.put((path, None))
+
+    def _fill_strip_from_preview(self):
+        if not self.paths or self._current_qimage is None:
+            return
+        path = self.paths[self.index]
+        cell = self.strip.cell_for_path(path)
+        if cell is None or (not cell.pixmap.isNull() and not pixmap_is_placeholder(cell.pixmap)):
+            return
+        cell.set_pixmap(QPixmap.fromImage(self._current_qimage))
+        self._pending_thumbs.discard(path)
+        self._strip_retries.pop(path, None)
 
     def _highlight_strip(self):
-        if 0 <= self.index < self.strip.count():
-            self.strip.setCurrentRow(self.index)
-            item = self.strip.item(self.index)
-            if item:
-                self.strip.scrollToItem(item, QAbstractItemView.ScrollHint.EnsureVisible)
-
-    def _strip_clicked(self, item):
-        self.goto(self.strip.row(item))
+        self.strip.set_selected_index(self.index)

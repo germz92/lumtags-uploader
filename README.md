@@ -51,7 +51,8 @@ powershell -File scripts/build_windows.ps1
    [Sony Camera Remote SDK](https://support.d-imaging.sony.co.jp/app/sdk/en/index.html)
    (Mac zip on a Mac, Win64 zip on Windows). Keep it off git.
 2. Build `crsdk_host` — see [crsdk_host/README.md](crsdk_host/README.md).
-3. Camera USB mode: **Remote Shoot (PC Remote)**. Quit Imaging Edge.
+3. Camera USB mode: **Remote Shoot (PC Remote)**. On a Mac you can leave Photos and
+   Image Capture open; the app takes the camera from them. On Windows, quit Imaging Edge.
    - Windows: install libusbK.
    - macOS: data cable only; allow USB accessories if asked.
 

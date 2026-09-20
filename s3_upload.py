@@ -3,7 +3,7 @@ import os
 import time
 import csv
 from dotenv import load_dotenv
-from platform_support import executable_dir
+from platform_support import app_support_dir, executable_dir
 from upload_tracker import load_uploaded_files, add_uploaded_file
 from botocore.exceptions import ClientError, NoCredentialsError
 from status_events import (
@@ -17,6 +17,7 @@ import random
 
 load_dotenv()
 load_dotenv(os.path.join(executable_dir(), ".env"))
+load_dotenv(os.path.join(app_support_dir(), ".env"))
 
 # AWS configuration from environment variables
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")

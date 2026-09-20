@@ -1,12 +1,15 @@
 import os
 import queue
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 from PySide6.QtCore import QRect, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -34,7 +37,13 @@ from camera_protocol import (
 )
 from event_thumbs import load_event_thumb
 from events_model import find_collection
-from platform_support import camera_setup_steps, default_parent_path, no_camera_hint
+from platform_support import (
+    SUPPORTED_CAMERAS,
+    camera_setup_steps,
+    default_parent_path,
+    disable_mac_camera_hotplug,
+    no_camera_hint,
+)
 from tether_session import create_tether_folder, load_last_session, suggested_folder_name
 import theme
 
@@ -57,7 +66,7 @@ STEP_COPY = {
     ),
     "collection": (
         "Which folder inside that gallery?",
-        "Photos upload into this collection: ceremony, portraits, and so on.",
+        "Photos upload into this collection: Day 1, Headshots, and so on.",
     ),
     "folder": (
         "Where should photos land on this computer?",
@@ -65,7 +74,7 @@ STEP_COPY = {
     ),
     "camera": (
         "Connect the camera now",
-        "Wait until this screen to plug it in and turn it on. If it was already connected, unplug it, then plug it back in.",
+        "",
     ),
 }
 
@@ -259,6 +268,10 @@ class EventChooser(QWidget):
         self._thumb_ready = queue.Queue()
         self._sort_key = "date"
         self._sort_desc = True
+        # A thread per event saturates a slow connection and the covers all
+        # time out together. A few at a time arrive sooner and more reliably.
+        self._thumb_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="thumb")
+        self._thumbs_requested = set()
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -270,8 +283,9 @@ class EventChooser(QWidget):
         self.search.setClearButtonEnabled(True)
         self.search.textChanged.connect(self._apply_filter)
         bar.addWidget(self.search, 1)
+        self._sort_labels = {"name": "Event name", "date": "Event date"}
         self._sort_group_buttons = []
-        for key, label in (("name", "Event name"), ("date", "Event date")):
+        for key, label in self._sort_labels.items():
             btn = QToolButton()
             btn.setText(label)
             btn.setCheckable(True)
@@ -280,8 +294,7 @@ class EventChooser(QWidget):
             btn.clicked.connect(lambda checked=False, value=key: self._on_sort(value))
             bar.addWidget(btn)
             self._sort_group_buttons.append((key, btn))
-            btn.style().unpolish(btn)
-            btn.style().polish(btn)
+        self._refresh_sort_buttons()
         layout.addLayout(bar)
 
         self.list = QListWidget()
@@ -358,18 +371,22 @@ class EventChooser(QWidget):
             item.setToolTip(event.name)
             self.list.addItem(item)
             self._items[event.id] = item
-            if event.image_ref:
-                threading.Thread(
-                    target=self._load_thumb,
-                    args=(event.id, event.image_ref, event.image_kind == "logo"),
-                    daemon=True,
-                ).start()
+            # _fill() runs again on every re-sort; the cover only needs fetching once.
+            if event.image_ref and event.id not in self._thumbs_requested:
+                self._thumbs_requested.add(event.id)
+                self._thumb_pool.submit(
+                    self._load_thumb, event.id, event.image_ref, event.image_kind == "logo"
+                )
         self._apply_filter()
 
     def _load_thumb(self, event_id, image_ref, contain=False):
         qimage = load_event_thumb(event_id, image_ref, contain=contain)
         if qimage is not None:
             self._thumb_ready.put((event_id, qimage))
+
+    def shutdown(self):
+        # Drop queued covers rather than make quitting wait on the network.
+        self._thumb_pool.shutdown(wait=False, cancel_futures=True)
 
     def _apply_thumbs(self):
         updated = False
@@ -391,12 +408,29 @@ class EventChooser(QWidget):
         else:
             self._sort_key = key
             self._sort_desc = key == "date"
-        for sort_key, btn in self._sort_group_buttons:
-            btn.setChecked(sort_key == self._sort_key)
+        self._refresh_sort_buttons()
         current = self.selected_id
         self._reorder()
         if current:
             self.select_id(current)
+
+    def _refresh_sort_buttons(self):
+        for key, btn in self._sort_group_buttons:
+            base = self._sort_labels[key]
+            if key == self._sort_key:
+                arrow = "↓" if self._sort_desc else "↑"
+                if key == "name":
+                    tip = "Z–A" if self._sort_desc else "A–Z"
+                else:
+                    tip = "Newest first" if self._sort_desc else "Oldest first"
+                btn.setText(f"{base}  {arrow}")
+                btn.setToolTip(tip)
+            else:
+                btn.setText(base)
+                btn.setToolTip(f"Sort by {base.lower()}")
+            btn.setChecked(key == self._sort_key)
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
 
     def _reorder(self):
         items = [self.list.takeItem(0) for _ in range(self.list.count())]
@@ -610,7 +644,7 @@ class SetupWizard(QWidget):
     finished = Signal(object)
     _camera_ok = Signal(int, object)
     _camera_fail = Signal(int, str, str)
-    _camera_try = Signal(int, int, int)
+    _camera_try = Signal(int, int, int, str)
 
     def __init__(self, events, log_queue=None, parent=None):
         super().__init__(parent)
@@ -645,7 +679,8 @@ class SetupWizard(QWidget):
         self._build_rail(root)
         self._build_body(root)
         self._show_step()
-        QTimer.singleShot(400, self._warmup_host)
+        disable_mac_camera_hotplug()
+        QTimer.singleShot(400, self._prepare_usb)
 
     def _refresh_rail(self):
         visible = [key for key, _label in STEPS if key in self.step_keys]
@@ -668,7 +703,7 @@ class SetupWizard(QWidget):
     def destroy_host(self):
         if self.host:
             try:
-                self.host.close()
+                self.host.close(force=True)
             except Exception:
                 pass
             self.host = None
@@ -746,7 +781,9 @@ class SetupWizard(QWidget):
         title, subtitle = STEP_COPY.get(key, ("", ""))
         self.title_label.setText(title)
         self.subtitle_label.setText(subtitle)
+        self.subtitle_label.setVisible(bool(subtitle))
         self._refresh_rail()
+        self._release_event_list()
         clear_layout(self.content_layout)
         self._host_timer.stop()
         self.back_btn.setEnabled(self.step_index > 0)
@@ -822,6 +859,15 @@ class SetupWizard(QWidget):
         self.folder_name = last.get("folder_name") or ""
         self.tether_folder = last.get("tether_folder") or ""
         self._folder_custom = bool(self.folder_name)
+
+    def _release_event_list(self):
+        chooser = getattr(self, "_event_list", None)
+        if chooser is not None:
+            chooser.shutdown()
+            self._event_list = None
+
+    def shutdown(self):
+        self._release_event_list()
 
     def _show_event(self):
         chooser = EventChooser(self.events)
@@ -923,6 +969,16 @@ class SetupWizard(QWidget):
         self._refresh_next()
 
     def _show_camera(self):
+        wait = QLabel("Wait until this screen before plugging in the camera.")
+        wait.setObjectName("importantCallout")
+        wait.setWordWrap(True)
+        self.content_layout.addWidget(wait)
+        already = QLabel(
+            "If it was already connected, unplug it, turn it off, plug it back in, then turn it back on."
+        )
+        already.setWordWrap(True)
+        self.content_layout.addWidget(already)
+
         for index, text in enumerate(camera_setup_steps(), start=1):
             step = QLabel(f"{index}.  {text}")
             step.setWordWrap(True)
@@ -936,17 +992,47 @@ class SetupWizard(QWidget):
         self.scan_btn = QPushButton("Scan again")
         self.scan_btn.clicked.connect(self._rescan)
         btn_row.addWidget(self.scan_btn)
+        cameras_btn = QPushButton("Supported cameras")
+        cameras_btn.clicked.connect(self._show_supported_cameras)
+        btn_row.addWidget(cameras_btn)
         btn_row.addStretch()
         self.content_layout.addLayout(btn_row)
         self._host_timer.start(200)
         QTimer.singleShot(80, lambda gen=self._step_gen: self._scan_cameras(gen))
 
-    def _warmup_host(self):
+    def _show_supported_cameras(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Supported cameras")
+        dialog.resize(420, 520)
+        layout = QVBoxLayout(dialog)
+        intro = QLabel(
+            "Sony bodies that work with this app over USB Remote Shooting / PC Remote. "
+            "Set USB mode to Remote Shoot before connecting."
+        )
+        intro.setWordWrap(True)
+        intro.setObjectName("dim")
+        layout.addWidget(intro)
+        for group, models in SUPPORTED_CAMERAS:
+            heading = QLabel(group)
+            heading.setObjectName("cameraTitle")
+            layout.addWidget(heading)
+            for model in models:
+                line = QLabel(f"  {model}")
+                line.setWordWrap(True)
+                layout.addWidget(line)
+        layout.addStretch()
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(dialog.reject)
+        buttons.accepted.connect(dialog.accept)
+        layout.addWidget(buttons)
+        dialog.exec()
+
+    def _prepare_usb(self):
         try:
-            self._ensure_host()
+            disable_mac_camera_hotplug()
         except Exception as exc:
             if self.log_queue:
-                self.log_queue.put(f"Camera host warmup failed: {exc}")
+                self.log_queue.put(f"USB prepare failed: {exc}")
 
     def _ensure_host(self):
         if self.host and self.host.is_running():
@@ -961,12 +1047,14 @@ class SetupWizard(QWidget):
     def _rescan(self):
         if self.step_keys[self.step_index] != "camera":
             return
+        self._step_gen += 1
         self._camera_busy = False
         if self.host:
             try:
-                self.host.disconnect()
+                self.host.close()
             except Exception:
                 pass
+            self.host = None
         self._scan_cameras()
 
     def _scan_cameras(self, gen=None):
@@ -982,39 +1070,39 @@ class SetupWizard(QWidget):
         self._camera_busy = True
         if hasattr(self, "scan_btn"):
             self.scan_btn.setEnabled(False)
-        self._set_camera_state("scanning")
+        self._set_camera_state("scanning", "Looking for a camera…", "Starting the camera host.")
         self._refresh_next()
-        try:
-            host = self._ensure_host()
-        except Exception as exc:
-            self._on_camera_fail(self._step_gen, str(exc), getattr(exc, "hint", HINT_USB))
-            return
+        if not self.host or not self.host.is_running():
+            self.host = CameraHost()
         threading.Thread(
             target=self._camera_worker,
-            args=(self._step_gen, host),
+            args=(self._step_gen, self.host),
             daemon=True,
         ).start()
 
     def _camera_worker(self, gen, host):
         def progress(attempt, total):
-            self._camera_try.emit(gen, attempt, total)
+            self._camera_try.emit(gen, attempt, total, "")
+
+        def status(message):
+            self._camera_try.emit(gen, 0, 0, message)
 
         try:
             folder = create_tether_folder(self.parent_path, self.folder_name)
-            data = dict(host.connect("", folder, on_attempt=progress) or {})
+            data = dict(host.connect("", folder, on_attempt=progress, on_status=status) or {})
             data["save_dir"] = folder
             self._camera_ok.emit(gen, data)
         except Exception as exc:
             self._camera_fail.emit(gen, str(exc), getattr(exc, "hint", "") or HINT_USB)
 
-    def _on_camera_try(self, gen, attempt, total):
+    def _on_camera_try(self, gen, attempt, total, message=""):
         if gen != self._step_gen:
             return
-        self._set_camera_state(
-            "scanning",
-            "Looking for a camera…",
-            f"This will usually take a few seconds. Try {attempt} of {total}.",
-        )
+        if attempt and total:
+            detail = message or f"Try {attempt} of {total}. This can take a few seconds."
+            self._set_camera_state("scanning", f"Looking for a camera…  ({attempt}/{total})", detail)
+        elif message:
+            self._set_camera_state("scanning", "Looking for a camera…", message)
 
     def _on_camera_ok(self, gen, data):
         if gen != self._step_gen:
@@ -1057,17 +1145,16 @@ class SetupWizard(QWidget):
                 break
             name = msg.get("name")
             if name == EVENT_CAMERA_FOUND:
-                model = msg.get("model") or msg.get("name") or "Sony camera"
+                model = msg.get("model") or "Sony camera"
                 self._set_camera_state("connecting", f"Connecting to {model}…")
             elif name == EVENT_DISCONNECTED:
                 self.camera = None
                 self._set_camera_state("lost")
                 self._refresh_next()
             elif name == EVENT_RECONNECTING:
-                attempt = msg.get("attempt", 1)
-                self._set_camera_state("connecting", f"Reconnecting…", f"Try {attempt}")
+                self._set_camera_state("connecting", "Reconnecting…")
             elif name == EVENT_CONNECTED:
-                model = msg.get("model") or msg.get("name") or "Camera"
+                model = msg.get("model") or "Camera"
                 self.camera = self.host.camera or self.camera or {"name": model}
                 self._set_camera_state(
                     "connected",

@@ -36,14 +36,18 @@ from camera_protocol import (
 )
 from platform_support import (
     IS_FROZEN,
+    IS_MAC,
     kill_stale_camera_hosts,
     native_host_candidates,
     popen_kwargs,
+    prepare_camera_usb,
     resource_root,
+    USE_PTP_BACKEND,
+    wait_for_sony_usb,
 )
 
-CONNECT_ATTEMPTS = 4
-CONNECT_TIMEOUT = 28
+CONNECT_ATTEMPTS = 2
+CONNECT_TIMEOUT = 140
 
 RECONNECT_BACKOFF = (2, 3, 5, 10)
 
@@ -85,6 +89,9 @@ class CameraHost:
         native = find_native_host()
         if native:
             args = [native]
+            if IS_MAC:
+                # Always explicit, so the host never picks a different default.
+                args.append("--ptp" if USE_PTP_BACKEND else "--crsdk")
             self.using_simulator = False
             host_cwd = os.path.dirname(os.path.abspath(native))
         else:
@@ -116,29 +123,42 @@ class CameraHost:
     def is_running(self):
         return bool(self._proc and self._proc.poll() is None)
 
-    def close(self):
+    def close(self, force=False, forget=True):
         self._stop.set()
-        self._want_connected = False
+        if forget:
+            self._want_connected = False
+        if not force:
+            try:
+                self._send(CMD_DISCONNECT, wait=False)
+            except Exception:
+                pass
         try:
             self._send(CMD_SHUTDOWN, wait=False)
         except Exception:
             pass
-        if self._proc and self._proc.poll() is None:
-            try:
-                self._proc.terminate()
-                self._proc.wait(timeout=3)
-            except Exception:
-                try:
-                    self._proc.kill()
-                except Exception:
-                    pass
+        proc = self._proc
         self._proc = None
         self.connected = False
+        if proc and proc.poll() is None:
+            wait = 0.4 if force else 1.5
+            try:
+                proc.terminate()
+                proc.wait(timeout=wait)
+            except Exception:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=0.4)
+                except Exception:
+                    pass
+        if force:
+            kill_stale_camera_hosts()
 
     def restart(self):
-        self.close()
+        want = self._want_connected
+        self.close(forget=False)
         self._stop = threading.Event()
         self._pending = {}
+        self._want_connected = want
         return self.start()
 
     def enumerate(self, timeout=20):
@@ -149,26 +169,45 @@ class CameraHost:
             raise CameraHostError(error, hint=hint)
         return list((reply.get("data") or {}).get("cameras") or [])
 
-    def connect(self, device_id, save_dir, timeout=CONNECT_TIMEOUT, on_attempt=None):
+    def connect(self, device_id, save_dir, timeout=CONNECT_TIMEOUT, on_attempt=None, on_status=None):
         self._device_id = device_id
         self.save_dir = os.path.abspath(save_dir)
         self._want_connected = True
         last_error = None
+
+        def status(message):
+            if on_status:
+                on_status(message)
+
         for attempt in range(1, CONNECT_ATTEMPTS + 1):
             if on_attempt:
                 on_attempt(attempt, CONNECT_ATTEMPTS)
+            if self._stop.is_set():
+                break
+            prepare_camera_usb(on_status=status)
+            if not wait_for_sony_usb(timeout=10, on_status=status):
+                status("No Sony USB yet. Scanning anyway…")
+            if not self.is_running():
+                status("Starting the camera host…")
+                try:
+                    self.start()
+                except Exception as exc:
+                    last_error = CameraHostError(str(exc))
+                    continue
+            status("Talking to the camera…")
             try:
                 return self._connect_once(device_id, self.save_dir, timeout)
             except CameraHostError as exc:
                 last_error = exc
-                if attempt >= CONNECT_ATTEMPTS or self._stop.is_set():
-                    break
-                time.sleep(1.2)
-                if attempt >= 2:
-                    try:
-                        self.restart()
-                    except Exception:
-                        pass
+            if attempt >= CONNECT_ATTEMPTS or self._stop.is_set():
+                break
+            status("Camera busy or not ready. Retrying…")
+            time.sleep(1.4)
+            try:
+                self.restart()
+            except Exception:
+                pass
+        self._want_connected = True
         raise last_error or CameraHostError("Could not connect to the camera.")
 
     def _connect_once(self, device_id, save_dir, timeout):
@@ -209,10 +248,17 @@ class CameraHost:
             if wait:
                 self._pending[req_id] = waiter
             line = encode(command(cmd, req_id, **fields))
-            if not self._proc or not self._proc.stdin:
+            if not self._proc or not self._proc.stdin or self._proc.poll() is not None:
                 raise CameraHostError("Camera host is not running.")
-            self._proc.stdin.write(line)
-            self._proc.stdin.flush()
+            try:
+                self._proc.stdin.write(line)
+                self._proc.stdin.flush()
+            except BrokenPipeError as exc:
+                raise CameraHostError("Camera host closed unexpectedly.") from exc
+            except OSError as exc:
+                if getattr(exc, "errno", None) == 32:
+                    raise CameraHostError("Camera host closed unexpectedly.") from exc
+                raise
         if not wait:
             return None
         try:
@@ -271,7 +317,7 @@ class CameraHost:
                 self.camera = {
                     "id": msg.get("id") or previous.get("id"),
                     "model": msg.get("model") or previous.get("model"),
-                    "name": msg.get("name") or previous.get("name"),
+                    "name": msg.get("model") or previous.get("name"),
                     "serial": msg.get("serial") or previous.get("serial"),
                 }
             elif name == EVENT_RECONNECTING:
@@ -287,6 +333,14 @@ class CameraHost:
                 self.event_queue.put(restored)
             self.event_queue.put(msg)
 
+    def request_reconnect(self):
+        """Keep the session and start (or restart) auto-reconnect."""
+        self._want_connected = True
+        self.connected = False
+        if self._stop.is_set():
+            self._stop = threading.Event()
+        self._start_reconnect()
+
     def _start_reconnect(self):
         if self._reconnect_thread and self._reconnect_thread.is_alive():
             return
@@ -295,6 +349,7 @@ class CameraHost:
 
     def _reconnect_loop(self):
         attempt = 0
+        usb_was_gone = True
         while self._want_connected and not self._stop.is_set():
             if self.connected:
                 return
@@ -308,12 +363,21 @@ class CameraHost:
             time.sleep(delay)
             if not self._want_connected or self._stop.is_set():
                 return
+            if not wait_for_sony_usb(timeout=max(4, delay)):
+                usb_was_gone = True
+                attempt += 1
+                continue
             try:
-                cameras = self.enumerate(timeout=8)
-                if not cameras:
-                    attempt += 1
-                    continue
-                self.connect(self._device_id or cameras[0].get("id") or "", self.save_dir, timeout=25)
+                # Killing PTP on every retry drops the A7 IV into Remote Shooting error.
+                # Only reclaim USB when the camera just came back on the bus.
+                if usb_was_gone:
+                    prepare_camera_usb()
+                    time.sleep(1.6)
+                    usb_was_gone = False
+                # Long power-off leaves the Mac SDK process unable to Connect again.
+                self.restart()
+                device_id = self._device_id or ""
+                self._connect_once(device_id, self.save_dir, timeout=80)
                 return
             except Exception:
                 attempt += 1

@@ -21,3 +21,8 @@ ICameraBackend* create_simulator_backend();
 #ifdef CRSDK_AVAILABLE
 ICameraBackend* create_crsdk_backend();
 #endif
+
+#ifdef PTP_BACKEND_AVAILABLE
+// Talks PTP to the camera directly instead of going through the Sony SDK.
+ICameraBackend* create_ptp_backend();
+#endif

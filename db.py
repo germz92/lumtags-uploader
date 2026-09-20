@@ -1,81 +1,100 @@
 from pymongo import MongoClient
 from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError
 import os
+import time
 from dotenv import load_dotenv
 import atexit
 import threading
 from logger import get_logger
-from platform_support import executable_dir
+from platform_support import app_support_dir, executable_dir
 
 logger = get_logger("db")
 load_dotenv()
 load_dotenv(os.path.join(executable_dir(), ".env"))
+load_dotenv(os.path.join(app_support_dir(), ".env"))
 
 MONGO_URI = os.getenv("MONGO_URI")
 DATABASE_NAME = os.getenv("DATABASE_NAME", "test")
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "events")
 
-# Thread-safe client management
 _client = None
 _client_lock = threading.Lock()
 
+
 def get_client():
-    """Get or create MongoDB client with proper error handling"""
+    """Get or create MongoDB client. First real query does server selection."""
     global _client
     if _client is None:
         with _client_lock:
             if _client is None:
-                try:
-                    _client = MongoClient(
-                        MONGO_URI,
-                        serverSelectionTimeoutMS=20000,
-                        connectTimeoutMS=20000,
-                        socketTimeoutMS=20000,
-                        maxPoolSize=10,
-                        minPoolSize=1
-                    )
-                    # Test connection
-                    _client.admin.command('ismaster')
-                except (ConnectionFailure, ServerSelectionTimeoutError) as e:
-                    logger.error(f"Failed to connect to MongoDB: {e}")
-                    raise Exception(f"Failed to connect to MongoDB: {e}")
+                _client = MongoClient(
+                    MONGO_URI,
+                    serverSelectionTimeoutMS=8000,
+                    connectTimeoutMS=8000,
+                    socketTimeoutMS=15000,
+                    maxPoolSize=10,
+                    minPoolSize=0,
+                    # Event documents are mostly repetitive text, so they shrink
+                    # a lot on the wire. zlib ships with Python; the faster
+                    # codecs would add a dependency.
+                    compressors="zlib",
+                    zlibCompressionLevel=6,
+                )
     return _client
 
-def close_connection():
-    """Close MongoDB connection"""
-    global _client
-    if _client:
-        _client.close()
-        _client = None
 
-# Register cleanup on exit
+def close_connection():
+    global _client
+    with _client_lock:
+        if _client:
+            try:
+                _client.close()
+            except Exception:
+                pass
+            _client = None
+
+
 atexit.register(close_connection)
 
+
+def _with_retry(label, work):
+    last = None
+    for attempt in range(2):
+        try:
+            return work()
+        except (ConnectionFailure, ServerSelectionTimeoutError, Exception) as exc:
+            last = exc
+            logger.error(f"{label} failed (try {attempt + 1}): {exc}")
+            close_connection()
+            if attempt == 0:
+                time.sleep(0.4)
+    raise last
+
+
+# Each collection embeds an "images" array carrying face-recognition embeddings.
+# That is the entire weight of the events collection — hundreds of megabytes —
+# and the wizard only reads collection_name and collection_folder. Leave the
+# rest of the document intact so parsing keeps working if it grows a field.
+EVENT_FIELDS_EXCLUDED = {"eventCollections.images": 0}
+
+
 def get_events():
-    """
-    Retrieve all events from the 'events' collection in the MongoDB database.
-    """
-    try:
-        client = get_client()
-        db = client[DATABASE_NAME]
-        events = list(db[COLLECTION_NAME].find())
-        return events
-    except Exception as e:
-        logger.error(f"Error retrieving events: {e}")
-        return []
+    def read():
+        return list(get_client()[DATABASE_NAME][COLLECTION_NAME].find({}, EVENT_FIELDS_EXCLUDED))
+
+    return _with_retry("Events", read)
 
 
 def get_client_logos():
-    """Map client id -> logo URL for event-cover fallbacks."""
-    try:
-        client = get_client()
-        db = client[DATABASE_NAME]
+    def read():
         logos = {}
-        for doc in db["clients"].find({}, {"clientLogo": 1}):
+        for doc in get_client()[DATABASE_NAME]["clients"].find({}, {"clientLogo": 1}):
             url = doc.get("clientLogo")
             if url:
                 logos[str(doc["_id"])] = url
         return logos
-    except Exception as e:
-        logger.error(f"Error retrieving client logos: {e}")
+
+    try:
+        return _with_retry("Client logos", read)
+    except Exception:
         return {}

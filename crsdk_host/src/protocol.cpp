@@ -2,9 +2,14 @@
 
 #include <cstdlib>
 #include <iostream>
+#include <mutex>
 #include <sstream>
 
 void emit_line(const std::string& json) {
+    // The capture thread and the command thread both report, and a half-written
+    // line would be unparseable to the app. One line at a time.
+    static std::mutex out_mu;
+    std::lock_guard<std::mutex> lock(out_mu);
     std::cout << json << std::endl;
 }
 

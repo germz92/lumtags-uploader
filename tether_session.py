@@ -64,14 +64,14 @@ def sanitize_folder_name(name):
 def suggested_folder_name(event, collection):
     parts = []
     if event and event.name:
-        parts.append(event.name)
+        parts.append(sanitize_folder_name(event.name))
     if collection and collection.collection_name:
-        parts.append(collection.collection_name)
+        parts.append(sanitize_folder_name(collection.collection_name))
     if event and getattr(event, "event_date", None):
         parts.append(event.event_date.strftime("%Y-%m-%d"))
     else:
         parts.append(datetime.now().strftime("%Y-%m-%d"))
-    return sanitize_folder_name(" ".join(parts))
+    return "-".join(part for part in parts if part)[:120]
 
 
 def create_tether_folder(parent_path, name):

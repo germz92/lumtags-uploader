@@ -14,6 +14,7 @@ host_candidates = [
     os.path.join(root, "crsdk_host", "build", "Release", host_name),
     os.path.join(root, "crsdk_host", "build", host_name),
     os.path.join(root, "dist", host_name),
+    os.path.join(os.path.expanduser("~"), "sdk", "crsdk_host_bin", host_name),
 ]
 binaries = []
 datas = [
@@ -26,10 +27,13 @@ for path in host_candidates:
         binaries.append((path, "."))
         for name in os.listdir(host_dir):
             full = os.path.join(host_dir, name)
-            if name.lower().endswith(".dll"):
+            if name.lower().endswith((".dll", ".dylib")):
                 binaries.append((full, "."))
             elif name == "CrAdapter" and os.path.isdir(full):
                 datas.append((full, "CrAdapter"))
+        adapter = os.path.join(host_dir, "Contents", "Frameworks", "CrAdapter")
+        if os.path.isdir(adapter):
+            datas.append((adapter, os.path.join("Contents", "Frameworks", "CrAdapter")))
         break
 
 a = Analysis(
@@ -65,7 +69,9 @@ exe = EXE(
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
-    entitlements_file=None,
+    entitlements_file=os.path.join(root, "packaging", "macos.entitlements")
+    if sys.platform == "darwin"
+    else None,
     icon=os.path.join(root, "assets", "app_icon.ico"),
 )
 
@@ -89,7 +95,8 @@ if sys.platform == "darwin":
         info_plist={
             "CFBundleName": "LumTags Uploader",
             "CFBundleDisplayName": "LumTags Uploader",
-            "CFBundleShortVersionString": "1.0.0",
+            "CFBundleShortVersionString": "1.3.1",
+            "CFBundleVersion": "1.3.1",
             "NSHighResolutionCapable": True,
             "NSUSBAccessoryUsageDescription": (
                 "LumTags Uploader connects to your Sony camera over USB to receive JPEGs."

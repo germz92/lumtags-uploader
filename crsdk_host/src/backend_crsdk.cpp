@@ -33,6 +33,7 @@
 #include <condition_variable>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -45,6 +46,14 @@
 namespace SDK = SCRSDK;
 
 namespace {
+
+#ifdef __APPLE__
+void claim_mac_usb() {
+    // Only immediately before Connect. Killing during enum hides the camera.
+    std::system("killall -9 ptpcamerad PTPCamera Photos 2>/dev/null");
+    std::system("killall -9 'Imaging Edge' 'Imaging Edge Remote' 'Image Capture' 2>/dev/null");
+}
+#endif
 
 #ifdef _WIN32
 std::string cr_to_utf8(const CrChar* text) {
@@ -114,7 +123,7 @@ public:
 
     std::vector<CameraInfo> enumerate() override {
         std::vector<CameraInfo> cameras;
-        SDK::ICrEnumCameraObjectInfo* objects = wait_enum_objects();
+        SDK::ICrEnumCameraObjectInfo* objects = wait_enum_objects(5);
         if (!objects) {
             return cameras;
         }
@@ -146,6 +155,8 @@ public:
         requested_disconnect_ = false;
         session_conflict_ = false;
         session_ready_ = false;
+        handshake_active_ = false;
+        handshake_failed_ = false;
         lost_emitted_ = false;
         dest_applied_ = false;
         dest_hinted_ = false;
@@ -162,6 +173,7 @@ public:
 
     void disconnect() override {
         requested_disconnect_ = true;
+        handshake_active_ = false;
         cv_.notify_all();
         if (settings_thread_.joinable() && settings_thread_.get_id() != std::this_thread::get_id()) {
             settings_thread_.join();
@@ -173,6 +185,10 @@ public:
             SDK::Disconnect(handle_);
             SDK::ReleaseDevice(handle_);
             handle_ = 0;
+        }
+        if (camera_info_) {
+            camera_info_->Release();
+            camera_info_ = nullptr;
         }
         callback_.reset();
         session_ready_ = false;
@@ -188,6 +204,7 @@ public:
     }
 
     void handle_connected() {
+        std::fprintf(stderr, "crsdk: OnConnected %s\n", camera_model_.c_str());
         session_ready_ = true;
         cv_.notify_all();
         if (session_conflict_) {
@@ -196,8 +213,7 @@ public:
         }
         lost_emitted_ = false;
         std::string extra = std::string("\"id\":\"") + json_escape(camera_id_) +
-                            "\",\"model\":\"" + json_escape(camera_model_) +
-                            "\",\"name\":\"" + json_escape(camera_model_) + "\"";
+                            "\",\"model\":\"" + json_escape(camera_model_) + "\"";
         emit_event("connected", extra);
     }
 
@@ -206,6 +222,11 @@ public:
         session_ready_ = false;
         dest_applied_ = false;
         transfer_applied_ = false;
+        if (handshake_active_) {
+            handshake_failed_ = true;
+            cv_.notify_all();
+            return;
+        }
         if (!requested_disconnect_) {
             emit_lost_once("USB disconnected");
         }
@@ -253,15 +274,35 @@ public:
             cv_.notify_all();
             return;
         }
-        if (error == SDK::CrError_Connect_Disconnected || error == SDK::CrError_Connect_TimeOut) {
-            handle_link_lost();
+        if (error == SDK::CrError_Connect_TimeOut || error == SDK::CrError_Reconnect_TimeOut) {
+            // Imaging Edge / RemoteCli keep waiting. The SDK retries with Reconnecting_ON.
+            // Aborting here kills the USB session and the A7 IV shows Remote Shooting error.
+            std::fprintf(stderr, "crsdk: Connect timeout 0x%X handshake=%d, waiting\n",
+                         static_cast<unsigned>(error), handshake_active_.load() ? 1 : 0);
+            return;
+        }
+        if (error == SDK::CrError_Connect_FailBusy) {
+            std::fprintf(stderr, "crsdk: camera busy, waiting for OnConnected\n");
+            return;
+        }
+        if (error == SDK::CrError_Connect_Disconnected) {
+            if (handshake_active_) {
+                handshake_failed_ = true;
+                cv_.notify_all();
+                return;
+            }
+            // OnDisconnected is the source of truth for a dropped link.
         }
     }
 
     void handle_warning(CrInt32u warning) {
         std::fprintf(stderr, "crsdk: OnWarning 0x%X\n", static_cast<unsigned>(warning));
         if (warning == SDK::CrWarning_Connect_Reconnecting) {
-            handle_link_lost();
+            // Same as RemoteCli: log and let CrReconnecting_ON finish.
+            // Do not tear down the host — that leaves the camera on the orange
+            // Remote Shooting (connection error) icon.
+            std::fprintf(stderr, "crsdk: SDK reconnecting, keeping the session\n");
+            return;
         } else if (warning == SDK::CrWarning_Connect_Reconnected) {
             std::fprintf(stderr, "crsdk: SDK reconnected\n");
             dest_applied_ = false;
@@ -311,8 +352,7 @@ private:
         lost_emitted_ = false;
         cv_.notify_all();
         std::string extra = std::string("\"id\":\"") + json_escape(camera_id_) +
-                            "\",\"model\":\"" + json_escape(camera_model_) +
-                            "\",\"name\":\"" + json_escape(camera_model_) + "\"";
+                            "\",\"model\":\"" + json_escape(camera_model_) + "\"";
         emit_event("connected", extra);
     }
 
@@ -331,6 +371,10 @@ private:
             SDK::ReleaseDevice(handle_);
             handle_ = 0;
         }
+        if (camera_info_) {
+            camera_info_->Release();
+            camera_info_ = nullptr;
+        }
     }
 
     void recycle_sdk() {
@@ -342,9 +386,9 @@ private:
         callback_ = std::make_unique<CrCallback>(this);
     }
 
-    SDK::ICrEnumCameraObjectInfo* enum_objects_once() {
+    SDK::ICrEnumCameraObjectInfo* enum_objects_once(CrInt8u time_in_sec) {
         SDK::ICrEnumCameraObjectInfo* objects = nullptr;
-        auto err = SDK::EnumCameraObjects(&objects, 3);
+        auto err = SDK::EnumCameraObjects(&objects, time_in_sec);
         if (err != SDK::CrError_None) {
             std::fprintf(stderr, "crsdk: EnumCameraObjects failed 0x%X\n", static_cast<unsigned>(err));
             if (objects) {
@@ -361,21 +405,36 @@ private:
         return objects;
     }
 
-    SDK::ICrEnumCameraObjectInfo* wait_enum_objects() {
-        for (int attempt = 1; attempt <= 5; ++attempt) {
-            SDK::ICrEnumCameraObjectInfo* objects = enum_objects_once();
+    SDK::ICrEnumCameraObjectInfo* wait_enum_objects(int max_attempts) {
+        // Same idea as Imaging Edge / RemoteCli: EnumCameraObjects and wait.
+        // Do not reset USB here — that makes the camera disappear mid-scan.
+#ifdef __APPLE__
+        const CrInt8u enum_secs = 8;
+        const bool allow_recycle = false;
+#else
+        const CrInt8u enum_secs = 3;
+        const bool allow_recycle = true;
+#endif
+        for (int attempt = 1; attempt <= max_attempts; ++attempt) {
+            SDK::ICrEnumCameraObjectInfo* objects = enum_objects_once(enum_secs);
             if (objects) {
-                if (attempt > 1) {
-                    std::fprintf(stderr, "crsdk: camera found on enum try %d\n", attempt);
+                const auto* info = objects->GetCameraObjectInfo(0);
+                std::string model = info ? cr_to_utf8(info->GetModel()) : "";
+                if (model.empty() && info) {
+                    model = cr_to_utf8(info->GetName());
                 }
+                std::fprintf(stderr, "crsdk: enum try %d found %u camera(s) %s\n",
+                             attempt,
+                             static_cast<unsigned>(objects->GetCount()),
+                             model.c_str());
                 return objects;
             }
-            std::fprintf(stderr, "crsdk: no camera on enum try %d\n", attempt);
-            if (attempt == 2) {
+            std::fprintf(stderr, "crsdk: enum try %d found 0 cameras\n", attempt);
+            if (allow_recycle && attempt == 2) {
                 std::fprintf(stderr, "crsdk: recycling SDK after empty enum\n");
                 recycle_sdk();
-            } else if (attempt < 5) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(600));
+            } else if (attempt < max_attempts) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(800));
             }
         }
         return nullptr;
@@ -399,8 +458,13 @@ private:
         }
     }
 
-    bool connect_index(unsigned index, std::string& error) {
-        SDK::ICrEnumCameraObjectInfo* objects = wait_enum_objects();
+    bool connect_index(unsigned index, std::string& error, bool quick_enum) {
+#ifdef __APPLE__
+        const int enum_tries = quick_enum ? 2 : 3;
+#else
+        const int enum_tries = 5;
+#endif
+        SDK::ICrEnumCameraObjectInfo* objects = wait_enum_objects(enum_tries);
         if (!objects) {
             error = "No Sony camera found.";
             return false;
@@ -417,53 +481,120 @@ private:
         if (camera_model_.empty()) {
             camera_model_ = "Sony camera";
         }
+        std::fprintf(stderr, "crsdk: %s usbPid=0x%X conn=%s adaptor=%s pairing=%s ssh=%u status=%u\n",
+                     camera_model_.c_str(),
+                     static_cast<unsigned>(info->GetUsbPid()) & 0xFFFF,
+                     cr_to_utf8(info->GetConnectionTypeName()).c_str(),
+                     cr_to_utf8(info->GetAdaptorName()).c_str(),
+                     cr_to_utf8(info->GetPairingNecessity()).c_str(),
+                     static_cast<unsigned>(info->GetSSHsupport()),
+                     static_cast<unsigned>(info->GetConnectionStatus()));
         std::string found = std::string("\"id\":\"") + json_escape(camera_id_) +
-                            "\",\"model\":\"" + json_escape(camera_model_) +
-                            "\",\"name\":\"" + json_escape(camera_model_) + "\"";
+                            "\",\"model\":\"" + json_escape(camera_model_) + "\"";
         emit_event("camera_found", found);
+        if (camera_info_) {
+            camera_info_->Release();
+            camera_info_ = nullptr;
+        }
+        camera_info_ = SDK::CreateCameraObjectInfo(
+            info->GetName(),
+            info->GetModel(),
+            info->GetUsbPid(),
+            info->GetIdType(),
+            info->GetIdSize(),
+            info->GetId(),
+            info->GetConnectionTypeName(),
+            info->GetAdaptorName(),
+            info->GetPairingNecessity(),
+            info->GetSSHsupport());
+        objects->Release();
+        objects = nullptr;
+        if (!camera_info_) {
+            error = "Could not copy camera info.";
+            return false;
+        }
         if (!callback_) {
             callback_ = std::make_unique<CrCallback>(this);
         }
+#ifdef __APPLE__
+        claim_mac_usb();
+        std::this_thread::sleep_for(std::chrono::milliseconds(800));
+#endif
         session_ready_ = false;
         session_conflict_ = false;
+        handshake_failed_ = false;
+        handshake_active_ = true;
+        std::fprintf(stderr, "crsdk: Connect %s\n", camera_model_.c_str());
         auto err = SDK::Connect(
-            const_cast<SDK::ICrCameraObjectInfo*>(info),
+            camera_info_,
             callback_.get(),
             &handle_,
             SDK::CrSdkControlMode_Remote,
             SDK::CrReconnecting_ON);
-        objects->Release();
         if (err != SDK::CrError_None || handle_ == 0) {
+            handshake_active_ = false;
             std::fprintf(stderr, "crsdk: Connect failed 0x%X\n", static_cast<unsigned>(err));
             error = "Connect failed. Set USB mode to Remote Shoot (PC Remote).";
             handle_ = 0;
             return false;
         }
         std::unique_lock<std::mutex> lock(mu_);
-        cv_.wait_for(lock, std::chrono::seconds(10), [&] {
-            return session_ready_.load() || session_conflict_.load();
+#ifdef __APPLE__
+        const int handshake_secs = 45;
+#else
+        const int handshake_secs = 15;
+#endif
+        cv_.wait_for(lock, std::chrono::seconds(handshake_secs), [&] {
+            return session_ready_.load() || session_conflict_.load() || handshake_failed_.load();
         });
+        handshake_active_ = false;
         return true;
     }
 
     bool open_remote_session(unsigned index, std::string& error) {
-        if (!connect_index(index, error)) {
-            return false;
-        }
-        if (session_conflict_) {
-            std::fprintf(stderr, "crsdk: recycling SDK after leftover session\n");
-            recycle_sdk();
-            requested_disconnect_ = false;
-            if (!connect_index(index, error)) {
-                return false;
+#ifdef __APPLE__
+        const int connect_tries = 2;
+#else
+        const int connect_tries = 2;
+#endif
+        for (int attempt = 1; attempt <= connect_tries; ++attempt) {
+            handshake_failed_ = false;
+            if (!connect_index(index, error, attempt > 1)) {
+                close_handle();
+                if (attempt == connect_tries) {
+                    return false;
+                }
+                std::fprintf(stderr, "crsdk: Connect attempt %d failed, retrying\n", attempt);
+                std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+                continue;
+            }
+#ifndef __APPLE__
+            if (session_conflict_) {
+                std::fprintf(stderr, "crsdk: recycling SDK after leftover session\n");
+                recycle_sdk();
+                requested_disconnect_ = false;
+                if (!connect_index(index, error, false)) {
+                    close_handle();
+                    if (attempt == connect_tries) {
+                        break;
+                    }
+                    continue;
+                }
+            }
+#endif
+            if (session_ready_) {
+                return true;
+            }
+            std::fprintf(stderr, "crsdk: no OnConnected after attempt %d (conflict=%d timeout=%d)\n",
+                         attempt, session_conflict_.load() ? 1 : 0, handshake_failed_.load() ? 1 : 0);
+            close_handle();
+            callback_.reset();
+            if (attempt < connect_tries) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1400));
             }
         }
-        if (session_conflict_ || !session_ready_) {
-            close_handle();
-            error = "Camera still has an old PC Remote session. Turn the camera off and on, then Scan again.";
-            return false;
-        }
-        return true;
+        error = "Camera did not finish the USB handshake. Unplug, power off, plug in, power on, then Scan again.";
+        return false;
     }
 
     void start_settings_retry() {
@@ -690,6 +821,7 @@ private:
     }
 
     SDK::CrDeviceHandle handle_ = 0;
+    SDK::ICrCameraObjectInfo* camera_info_ = nullptr;
     std::unique_ptr<CrCallback> callback_;
     std::string save_dir_;
     std::string camera_id_;
@@ -698,6 +830,8 @@ private:
     std::condition_variable cv_;
     std::atomic<bool> session_ready_{false};
     std::atomic<bool> session_conflict_{false};
+    std::atomic<bool> handshake_active_{false};
+    std::atomic<bool> handshake_failed_{false};
     std::atomic<bool> requested_disconnect_{false};
     std::atomic<bool> saveinfo_logged_{false};
     std::atomic<bool> lost_emitted_{false};

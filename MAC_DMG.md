@@ -15,9 +15,14 @@ Do **not** copy a Windows `.venv`, `crsdk_host/build`, or `CRSDK-Win64`. Those w
 
 ## What you are building
 
-Python + Qt app (`main.py`). It talks to a native helper, `crsdk_host`, which uses Sony’s Camera Remote SDK over USB. PyInstaller wraps that into `LumTags Uploader.app`. `scripts/build_dmg.sh` wraps the app in a DMG.
+Python + Qt app (`main.py`). It talks to a native helper, `crsdk_host`. On a Mac the
+helper talks PTP to the camera itself over IOKit, which is the default; Sony's Camera
+Remote SDK stays in as a fallback. PyInstaller wraps that into `LumTags Uploader.app`.
+`scripts/build_dmg.sh` wraps the app in a DMG.
 
-A photographer build needs a **real** `crsdk_host` linked against the Mac SDK. If that binary is missing, the app falls back to a JPEG simulator.
+`scripts/build_macos.sh` compiles the helper before packaging, and warns if the bundled
+binary has no PTP backend. If the helper is missing entirely, the app falls back to a
+JPEG simulator.
 
 ---
 
@@ -65,7 +70,7 @@ Run:
 python3 main.py
 ```
 
-The log should say `Camera host started (crsdk)`, not `simulator`. Walk the setup wizard, connect the camera, shoot a JPEG, confirm it appears and uploads.
+The log should say `Camera host started (ptp)` on a Mac, not `simulator`. Walk the setup wizard, connect the camera, shoot a JPEG, confirm it appears and uploads.
 
 **Stop here if the camera does not connect from source.** Packaging will only freeze a broken host.
 
@@ -110,7 +115,7 @@ APP="dist/LumTags Uploader.app"
 DMG="dist/LumTags Uploader.dmg"
 IDENTITY="Developer ID Application: Your Name (TEAMID)"
 
-codesign --deep --force --options runtime --sign "$IDENTITY" "$APP"
+CODESIGN_IDENTITY="$IDENTITY" ./scripts/build_macos.sh
 ./scripts/build_dmg.sh
 xcrun notarytool submit "$DMG" \
   --apple-id "you@example.com" \
@@ -127,7 +132,10 @@ xcrun notarytool history --apple-id "you@example.com" --team-id TEAMID --passwor
 xcrun notarytool log <SUBMISSION_ID> --apple-id "you@example.com" --team-id TEAMID --password "@keychain:AC_PASSWORD"
 ```
 
-USB / camera access may need extra entitlements under hardened runtime. If the signed app connects worse than the unsigned `.app`, that is the first place to look.
+Sign through `build_macos.sh` rather than calling `codesign` by hand. Under hardened
+runtime the helper needs `packaging/macos.entitlements` to load Sony's dylibs, and
+signing the bundle alone drops them. The script signs the dylibs, then `crsdk_host`
+with entitlements, then the bundle.
 
 If you do **not** have a Developer ID, still send the unsigned DMG and say so. It will only run on Macs that right-click → Open.
 

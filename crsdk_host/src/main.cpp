@@ -1,29 +1,59 @@
 #include "backend.h"
 #include "protocol.h"
 
+#include <cstdlib>
 #include <memory>
 #include <sstream>
 #include <string>
 
+namespace {
+
+bool env_bool(const char* name, bool fallback) {
+    const char* value = std::getenv(name);
+    if (!value || !*value) {
+        return fallback;
+    }
+    const std::string text(value);
+    return !(text == "0" || text == "false" || text == "no" || text == "off");
+}
+
+}  // namespace
+
 int main(int argc, char** argv) {
     bool want_simulator = false;
+    // PTP is the default where it is built; the SDK is the fallback.
+    bool want_ptp = env_bool("LUMTAGS_PTP", true);
+    bool want_crsdk = env_bool("LUMTAGS_CRSDK", false);
     for (int i = 1; i < argc; ++i) {
-        if (std::string(argv[i]) == "--simulator") {
+        const std::string arg = argv[i];
+        if (arg == "--simulator") {
             want_simulator = true;
+        } else if (arg == "--ptp") {
+            want_ptp = true;
+            want_crsdk = false;
+        } else if (arg == "--crsdk") {
+            want_crsdk = true;
+            want_ptp = false;
         }
     }
 
     std::unique_ptr<ICameraBackend> backend;
-#ifdef CRSDK_AVAILABLE
     if (want_simulator) {
         backend.reset(create_simulator_backend());
-    } else {
+    }
+#ifdef PTP_BACKEND_AVAILABLE
+    if (!backend && want_ptp && !want_crsdk) {
+        backend.reset(create_ptp_backend());
+    }
+#endif
+#ifdef CRSDK_AVAILABLE
+    if (!backend) {
         backend.reset(create_crsdk_backend());
     }
-#else
-    (void)want_simulator;
-    backend.reset(create_simulator_backend());
 #endif
+    if (!backend) {
+        backend.reset(create_simulator_backend());
+    }
 
     emit_hello(backend->name());
 
